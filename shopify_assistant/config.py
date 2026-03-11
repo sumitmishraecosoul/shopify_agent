@@ -31,8 +31,10 @@ class Settings(BaseSettings):
     CLICKHOUSE_DATABASE: str = "shopify_assistant"
 
     # Shopify (you will fill these with real values in deployment)
-    SHOPIFY_STORE_DOMAIN: Optional[str] = None  # e.g. "yourstore.myshopify.com"
+    SHOPIFY_STORE_DOMAIN: Optional[str] = None  # e.g. "https://www.ecosoulhome.com"
     SHOPIFY_STOREFRONT_API_TOKEN: Optional[str] = None
+    # Cart token from browser cookie "cart" (or from GET /cart.js). Optional: set in .env for server-side testing; in production frontend sends cart_token in request body.
+    SHOPIFY_CART_TOKEN: Optional[str] = None
 
     class Config:
         env_file = str(_env_path) if _env_path.exists() else ".env"

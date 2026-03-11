@@ -22,37 +22,176 @@ BACKEND_URL = f"http://localhost:{BACKEND_PORT}"
 
 
 def send_message(session_id: str, message: str, history: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    """
+    Call the external Shopify-style chat endpoint so the demo uses
+    the same schema Shopify developers will consume.
+    """
     payload = {
         "session_id": session_id,
         "message": message,
         "conversation_history": history or [],
     }
-    resp = requests.post(f"{BACKEND_URL}/chat", json=payload, timeout=60)
+    resp = requests.post(f"{BACKEND_URL}/api/v1/chat", json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json()
 
 
+def _add_to_mock_cart(title: str, variant_id: str, quantity: int) -> None:
+    variant_id = str(variant_id or "")
+    quantity = int(quantity or 1)
+    if quantity <= 0:
+        return
+    for item in st.session_state.cart:
+        if str(item.get("variant_id")) == variant_id and variant_id:
+            item["quantity"] = int(item.get("quantity", 0) or 0) + quantity
+            return
+    st.session_state.cart.append({"title": title, "variant_id": variant_id, "quantity": quantity})
+
+
+def _submit_user_message(msg: str) -> None:
+    msg = (msg or "").strip()
+    if not msg:
+        return
+    st.session_state.messages.append({"role": "user", "content": msg})
+    backend_resp = send_message(st.session_state.session_id, msg)
+    resp_payload = backend_resp.get("response", {}) or {}
+    bot_text = resp_payload.get("message", "") or ""
+    resp_type = resp_payload.get("type", "")
+    st.session_state.messages.append(
+        {"role": "assistant", "content": f"[{resp_type}] {bot_text}", "payload": resp_payload, "raw": backend_resp}
+    )
+
+
 def main() -> None:
-    st.set_page_config(page_title="Shopify Party Planner Assistant", page_icon="🥳", layout="centered")
-    st.title("Shopify Party Planner Assistant")
-    st.write("Talk to the assistant about your party and let it recommend plates, bowls, spoons, etc.")
+    st.set_page_config(page_title="EcoSoul AI Shopping Assistant", page_icon="🥳", layout="centered")
+    st.title("EcoSoul AI Shopping Assistant")
+    st.write("Chat with the assistant to plan parties or browse EcoSoul products.")
 
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
     if "messages" not in st.session_state:
-        st.session_state.messages = []  # each: {"role": "user"/"assistant", "content": str}
+        # Each message:
+        # - user: {"role": "user", "content": str}
+        # - assistant: {"role": "assistant", "content": str, "payload": dict}
+        st.session_state.messages = []
+    if "cart" not in st.session_state:
+        st.session_state.cart = []  # simple mock cart for demo
 
-    # Sidebar for debug info
+    # Sidebar for debug info + mock cart
     with st.sidebar:
         st.markdown("**Session ID**")
         st.code(st.session_state.session_id)
 
-    # Display chat history
-    for msg in st.session_state.messages:
+        st.markdown("---")
+        st.markdown("### Mock Cart")
+        if not st.session_state.cart:
+            st.caption("Cart is empty.")
+        else:
+            total_items = sum(int(i["quantity"]) for i in st.session_state.cart)
+            st.caption(f"Items: {total_items}")
+            for item in st.session_state.cart:
+                st.write(f"- **{item['title']}**  × {item['quantity']}")
+
+    # Display chat history (including product cards + buttons)
+    for msg_idx, msg in enumerate(st.session_state.messages):
         if msg["role"] == "user":
             st.markdown(f"**You:** {msg['content']}")
-        else:
-            st.markdown(f"**Assistant:** {msg['content']}")
+            continue
+
+        st.markdown(f"**Assistant:** {msg['content']}")
+
+        payload = msg.get("payload") or {}
+        products = payload.get("suggested_products") or []
+        if products:
+            st.markdown("**Recommended products**")
+            for idx, p in enumerate(products):
+                title = p.get("title", "")
+                price = p.get("price")
+                packs = int(p.get("packs_recommended", p.get("quantity", 1)) or 1)
+                pack_size = int(p.get("pack_size", 1) or 1)
+                total_units = p.get("total_units", packs * pack_size)
+
+                st.markdown("---")
+                row = st.container()
+                with row:
+                    c_info, c_qty, c_actions = st.columns([3, 2, 2])
+
+                    with c_info:
+                        st.markdown(f"**{title}**")
+                        if price is not None:
+                            st.caption(f"Price: ${price:.2f}")
+                        st.caption(f"Pack size: {pack_size}, total units: {total_units}")
+
+                    qty_key = f"qty_{msg_idx}_{idx}"
+                    if qty_key not in st.session_state:
+                        st.session_state[qty_key] = packs
+
+                    with c_qty:
+                        st.caption("Packs")
+                        minus_col, num_col, plus_col = st.columns([1, 2, 1])
+                        with minus_col:
+                            if st.button("−", key=f"minus_{msg_idx}_{idx}"):
+                                current = max(1, int(st.session_state[qty_key]) - 1)
+                                st.session_state[qty_key] = current
+                        with num_col:
+                            new_val = st.number_input(
+                                "Packs",
+                                min_value=1,
+                                max_value=999,
+                                value=int(st.session_state[qty_key]),
+                                key=f"num_{msg_idx}_{idx}",
+                                label_visibility="collapsed",
+                            )
+                            st.session_state[qty_key] = new_val
+                        with plus_col:
+                            if st.button("+", key=f"plus_{msg_idx}_{idx}"):
+                                current = int(st.session_state[qty_key]) + 1
+                                st.session_state[qty_key] = current
+
+                    with c_actions:
+                        if st.button("Add to cart", key=f"add_mock_{msg_idx}_{idx}"):
+                            _add_to_mock_cart(
+                                title=title,
+                                variant_id=str(p.get("variant_id", "")),
+                                quantity=int(st.session_state[qty_key]),
+                            )
+                            st.rerun()
+                        if st.button("Remove item", key=f"remove_{msg_idx}_{idx}"):
+                            _submit_user_message(f"remove {title}")
+                            st.rerun()
+
+        cart_items = payload.get("cart_items") or []
+        cart_permalink = payload.get("cart_permalink")
+        if cart_items or cart_permalink:
+            with st.expander("Cart payload (Shopify-ready)"):
+                if cart_items:
+                    st.json(cart_items)
+                if cart_permalink:
+                    st.code(cart_permalink)
+                    try:
+                        st.link_button("Open cart permalink", cart_permalink)
+                    except Exception:
+                        st.markdown(f"[Open cart permalink]({cart_permalink})")
+
+            # Add-all to mock cart button (uses cart_items)
+            if cart_items and st.button("Add ALL to mock cart", key=f"add_all_{msg_idx}"):
+                # Best effort titles from suggested_products list
+                vid_to_title = {str(p.get("variant_id")): p.get("title", "") for p in (products or [])}
+                for it in cart_items:
+                    vid = str(it.get("id") or "")
+                    qty = int(it.get("quantity", 1) or 1)
+                    _add_to_mock_cart(title=vid_to_title.get(vid) or "Item", variant_id=vid, quantity=qty)
+                st.rerun()
+
+        # Quick replies as buttons (nice for demos)
+        quick_replies = payload.get("quick_replies") or []
+        if quick_replies:
+            cols = st.columns(min(4, len(quick_replies)))
+            for i, qr in enumerate(quick_replies[:4]):
+                with cols[i]:
+                    if st.button(qr, key=f"qr_{msg_idx}_{i}"):
+                        _submit_user_message(qr)
+                        st.rerun()
 
     user_input = st.text_input("Your message", key="chat_input")
 
@@ -65,23 +204,14 @@ def main() -> None:
     if reset_btn:
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.messages = []
+        st.session_state.cart = []
         st.rerun()
 
     if send_btn and user_input.strip():
-        msg = user_input.strip()
-        st.session_state.messages.append({"role": "user", "content": msg})
-
         try:
-            backend_resp = send_message(st.session_state.session_id, msg)
+            _submit_user_message(user_input.strip())
         except Exception as e:
             st.error(f"Error calling backend: {e}")
-        else:
-            text = backend_resp.get("response", "")
-            st.session_state.messages.append({"role": "assistant", "content": text})
-
-            # Show structured data and actions in an expander
-            with st.expander("Debug: raw backend response"):
-                st.json(backend_resp)
 
         st.rerun()
 

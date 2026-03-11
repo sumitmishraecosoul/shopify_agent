@@ -16,6 +16,7 @@ from .models import (
 from .llm_client import llm_client
 from .engine import build_recommendation
 from .shopify_client import shopify_client
+from .external_api import router as external_router
 
 # In-memory session store for v1 (can be moved to ClickHouse/Redis later)
 SESSIONS: dict[str, SessionState] = {}
@@ -30,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# External, Shopify-facing API (L'Occitane-style responses)
+app.include_router(external_router)
 
 
 def _get_or_create_session(session_id: str) -> SessionState:
@@ -199,5 +203,7 @@ def cart_apply(req: CartApplyRequest) -> CartApplyResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=settings.PORT, reload=True)
+    # Use a direct app instance here (no reload/workers) so running
+    # `python -m shopify_assistant.main` works reliably in your venv.
+    uvicorn.run(app, host="0.0.0.0", port=settings.PORT)
 

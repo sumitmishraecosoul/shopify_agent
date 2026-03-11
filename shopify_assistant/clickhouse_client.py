@@ -67,9 +67,10 @@ class ClickHouseClient:
                 else:
                     eco_score = 3
 
-                # Price in cents if present; otherwise 0
+                # Price in cents; prefer explicit price_list if present, otherwise variant price
                 price_cents = 0
-                price = variant.get("price") or variant.get("compareAtPrice")
+                price_list = item.get("price_list") or {}
+                price = price_list.get("amount") or variant.get("price") or variant.get("compareAtPrice")
                 if price is not None:
                     try:
                         price_cents = int(float(price) * 100)
@@ -81,8 +82,14 @@ class ClickHouseClient:
 
                 products.append(
                     {
+                        # Internal identifier used by the recommendation engine (kept stable)
                         "product_id": str(variant.get("id") or item.get("id") or ""),
+                        # Extra Shopify identifiers for external API responses
+                        "variant_gid": str(variant.get("id") or ""),
+                        "product_gid": str(product.get("id") or ""),
+                        "handle": str(product.get("handle") or ""),
                         "title": title,
+                        "product_type": product_type,
                         "category": category,
                         "pack_size": pack_size,
                         "material": "",
@@ -115,6 +122,50 @@ class ClickHouseClient:
         # Sort roughly by eco_score desc, then price asc
         records.sort(key=lambda r: (-int(r.get("eco_score", 0)), int(r.get("price_cents", 0))))
         return records
+
+    def get_product_by_internal_id(self, product_id: str) -> Dict[str, Any] | None:
+        """
+        Look up a product record by the internal product_id we expose to the
+        recommendation engine. This is used by the external API layer to
+        enrich basket items with Shopify GIDs, handles, etc.
+        """
+        for p in self._products:
+            if str(p.get("product_id")) == str(product_id):
+                return p
+        return None
+
+    def search_products(
+        self,
+        query: str | None = None,
+        category: str | None = None,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """
+        Simple keyword and/or category search across the in-memory product list.
+        Intended for product browsing / fallback search flows.
+
+        Rules:
+        - If category is provided: we always filter by category and ignore query
+          (so 'Cold cups' and 'Hot cups' both show cups, even if titles differ).
+        - If no category: we use query to filter by title/product_type.
+        """
+        q = (query or "").strip().lower()
+        results: List[Dict[str, Any]] = []
+
+        for p in self._products:
+            if not p.get("available"):
+                continue
+            if category:
+                if p.get("category") != category:
+                    continue
+            elif q:
+                haystack = f"{p.get('title','')} {p.get('product_type','')}".lower()
+                if q not in haystack:
+                    continue
+            results.append(p)
+            if len(results) >= limit:
+                break
+        return results
 
 
 clickhouse_client = ClickHouseClient()
