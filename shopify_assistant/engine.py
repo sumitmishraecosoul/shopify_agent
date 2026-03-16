@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List
 
 from .models import PartyPlan, BasketItem, BasketRecommendation
@@ -16,72 +17,59 @@ def _compute_required_units(plan: PartyPlan) -> Dict[str, int]:
     people = plan.party_size
     required: Dict[str, int] = {}
 
-    # Explicit per-person quantities take priority
-    if getattr(plan, "plates_per_person", None) is not None and plan.plates_per_person is not None:
-        required["plates"] = people * max(0, int(plan.plates_per_person))
-    if getattr(plan, "spoons_per_person", None) is not None and plan.spoons_per_person is not None:
-        required["spoons"] = people * max(0, int(plan.spoons_per_person))
-    if getattr(plan, "bowls_per_person", None) is not None and plan.bowls_per_person is not None:
-        required["bowls"] = people * max(0, int(plan.bowls_per_person))
-    if getattr(plan, "cups_per_person", None) is not None and plan.cups_per_person is not None:
-        required["cups"] = people * max(0, int(plan.cups_per_person))
+    # Explicit per-person quantities take priority. If party planning didn't collect
+    # these yet, default to 1 per person for common disposables.
+    plates_pp = plan.plates_per_person if plan.plates_per_person is not None else 1
+    bowls_pp = plan.bowls_per_person if plan.bowls_per_person is not None else 1
+    cups_pp = plan.cups_per_person if plan.cups_per_person is not None else 1
+    spoons_pp = plan.spoons_per_person if plan.spoons_per_person is not None else 1
 
-    if required:
-        # Add ~10% backup (at least 1 extra) so recommendation is slightly above minimum
-        with_backup: Dict[str, int] = {}
-        for cat, units in required.items():
-            extra = max(1, (units * 10) // 100)
-            with_backup[cat] = units + extra
-        return with_backup
+    # When explicit per-person fields exist (or defaulted), use them.
+    required["plates"] = people * max(0, int(plates_pp))
+    required["bowls"] = people * max(0, int(bowls_pp))
+    required["cups"] = people * max(0, int(cups_pp))
+    required["spoons"] = people * max(0, int(spoons_pp))
 
-    # Fallback heuristic
-    disposables = plan.disposables_needed or ["plates", "bowls", "spoons"]
-    for item in disposables:
-        if item == "plates":
-            factor = 1.3 if plan.menu_type == "full_meal" else 1.0
-        elif item == "bowls":
-            factor = 1.0 if plan.menu_type == "full_meal" else 0.5
-        elif item == "spoons":
-            factor = 2.0 if "dessert" in (plan.courses or []) else 1.0
-        else:
-            factor = 1.0
-        required[item] = int(round(people * factor))
-    return required
+    # Respect explicit disposables_needed if provided: only keep those categories.
+    if plan.disposables_needed:
+        keep = {str(x).lower() for x in plan.disposables_needed}
+        required = {k: v for k, v in required.items() if k in keep}
+
+    # Add ~10% backup (at least 1 extra) so recommendation is slightly above minimum
+    with_backup: Dict[str, int] = {}
+    for cat, units in required.items():
+        extra = max(1, (units * 10) // 100)
+        with_backup[cat] = units + extra
+    return with_backup
 
 
 def _select_packs(required_units: int, products: List[dict]) -> List[dict]:
     """
-    Very basic greedy pack selection: choose cheapest pack_size first.
-    This is intentionally simple for v1.
+    Choose a pack option that covers required_units with minimal overage.
+    Tie-break by total price. For v1 demo, we keep this to a single SKU per category.
     """
     if required_units <= 0 or not products:
         return []
 
-    # Sort by price per unit ascending
-    enriched = []
+    best = None
+    best_score = None
     for p in products:
-        pack_size = int(p.get("pack_size", 1))
-        price_cents = int(p.get("price_cents", 0))
+        pack_size = int(p.get("pack_size", 1) or 1)
+        price_cents = int(p.get("price_cents", 0) or 0)
         if pack_size <= 0:
             continue
-        price_per_unit = price_cents / pack_size if pack_size else price_cents
-        enriched.append((price_per_unit, p))
 
-    enriched.sort(key=lambda x: x[0])
-    selected: List[dict] = []
-    remaining = required_units
+        packs = max(1, int(math.ceil(required_units / pack_size)))
+        total_units = packs * pack_size
+        overage = max(0, total_units - required_units)
+        total_price = packs * price_cents
 
-    for _, prod in enriched:
-        pack_size = int(prod.get("pack_size", 1))
-        if pack_size <= 0:
-            continue
-        packs = max(1, remaining // pack_size)
-        selected.append({**prod, "packs": packs})
-        remaining -= packs * pack_size
-        if remaining <= 0:
-            break
+        score = (overage, total_price, -pack_size)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = {**p, "packs": packs}
 
-    return selected
+    return [best] if best else []
 
 
 def build_recommendation(plan: PartyPlan) -> BasketRecommendation | None:

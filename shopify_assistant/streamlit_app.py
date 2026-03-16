@@ -32,9 +32,40 @@ def send_message(session_id: str, message: str, history: List[Dict[str, Any]] | 
         "conversation_history": history or [],
     }
     resp = requests.post(f"{BACKEND_URL}/api/v1/chat", json=payload, timeout=60)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # Provide a clean error payload so the UI doesn't crash on 500s.
+        return {
+            "success": False,
+            "session_id": session_id,
+            "response": {
+                "type": "error",
+                "message": f"Backend error ({resp.status_code}). Please check the backend terminal logs.",
+                "suggested_products": [],
+                "cart_items": [],
+                "cart_permalink": None,
+                "quick_replies": ["New session"],
+                "suggested_questions": [],
+            },
+            "conversation_context": {},
+            "raw_error": resp.text,
+        }
     return resp.json()
 
+
+def cart_add(session_id: str, items: List[Dict[str, Any]], cart_action: str = "add") -> Dict[str, Any]:
+    """
+    Call backend cart endpoint so the server-side cart payload stays updated.
+    """
+    payload = {
+        "session_id": session_id,
+        "items": items,
+        "cart_action": cart_action,
+        "checkout_after_add": False,
+        "cart_token": None,
+    }
+    resp = requests.post(f"{BACKEND_URL}/api/v1/cart/add", json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
 
 def _add_to_mock_cart(title: str, variant_id: str, quantity: int) -> None:
     variant_id = str(variant_id or "")
@@ -76,6 +107,18 @@ def main() -> None:
         st.session_state.messages = []
     if "cart" not in st.session_state:
         st.session_state.cart = []  # simple mock cart for demo
+
+    # Start CTA buttons (always visible at the beginning)
+    if not st.session_state.messages:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Plan a party", key="cta_plan_party"):
+                _submit_user_message("Plan a party")
+                st.rerun()
+        with c2:
+            if st.button("Browse products", key="cta_browse_products"):
+                _submit_user_message("Browse products")
+                st.rerun()
 
     # Sidebar for debug info + mock cart
     with st.sidebar:
@@ -150,11 +193,18 @@ def main() -> None:
 
                     with c_actions:
                         if st.button("Add to cart", key=f"add_mock_{msg_idx}_{idx}"):
-                            _add_to_mock_cart(
-                                title=title,
-                                variant_id=str(p.get("variant_id", "")),
-                                quantity=int(st.session_state[qty_key]),
+                            # Update backend cart payload (numeric variant id if possible)
+                            vid = str(p.get("variant_id", "") or "")
+                            # variant_id can be numeric already, or a Shopify GID like gid://shopify/ProductVariant/123
+                            vid_num = vid.split("/")[-1] if "gid://shopify" in vid else vid
+                            item_id: Any = int(vid_num) if str(vid_num).isdigit() else vid
+                            cart_add(
+                                st.session_state.session_id,
+                                items=[{"id": item_id, "quantity": int(st.session_state[qty_key])}],
+                                cart_action="add",
                             )
+                            # Keep mock cart in sidebar in sync for demo
+                            _add_to_mock_cart(title=title, variant_id=str(item_id), quantity=int(st.session_state[qty_key]))
                             st.rerun()
                         if st.button("Remove item", key=f"remove_{msg_idx}_{idx}"):
                             _submit_user_message(f"remove {title}")

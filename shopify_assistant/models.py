@@ -75,6 +75,8 @@ class SessionState(BaseModel):
     mode: Optional[ConversationMode] = None
     current_category: Optional[str] = None
     current_subcategory: Optional[str] = None
+    # Persisted cart payload for demo / Shopify integration (numeric variant ids)
+    cart_items: List[Dict[str, Any]] = []
 
 
 class ChatRequest(BaseModel):

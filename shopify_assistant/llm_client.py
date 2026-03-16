@@ -1,7 +1,9 @@
 import json
+import re
 from typing import Dict, Any, List
 
 import requests
+from requests.exceptions import RequestException
 
 from .config import settings
 from .models import Intent, PartyPlan
@@ -69,9 +71,61 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
         }
-        resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=120)
-        resp.raise_for_status()
-        return _parse_llm_response(resp) or "(No response)"
+        try:
+            resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=30)
+            resp.raise_for_status()
+            return _parse_llm_response(resp) or "(No response)"
+        except RequestException:
+            # If LLM is offline, return a short safe fallback.
+            last_user = ""
+            for m in reversed(messages or []):
+                if (m or {}).get("role") == "user":
+                    last_user = str((m or {}).get("content") or "")
+                    break
+            return "I can help with party planning or product browsing. Tell me how many guests you have and which city you're in."
+
+    def _heuristic_extract(self, user_message: str, current_plan: PartyPlan) -> Dict[str, Any]:
+        """
+        Deterministic fallback extractor when the LLM is unreachable.
+        """
+        text = (user_message or "").strip()
+        lower = text.lower()
+
+        slots: Dict[str, Any] = {}
+
+        # party_size: "50 guests" / "for 2000 people" / "200"
+        m = re.search(r"\b(\d{1,6})\b", lower)
+        if m and any(k in lower for k in ["guest", "guests", "people", "persons", "person", "attendees", "invite", "invited", "for"]):
+            try:
+                slots["party_size"] = int(m.group(1))
+            except Exception:
+                pass
+
+        # location: accept city-like strings when not a guest-count message
+        if any(ch.isalpha() for ch in text) and not any(k in lower for k in ["guest", "guests", "people", "persons"]):
+            if len(text) <= 60 and not any(k in lower for k in ["plan a party", "browse products", "browse", "products"]):
+                slots["location"] = text
+
+        # Mode hints
+        if any(k in lower for k in ["browse products", "browse", "show products", "tableware", "drinkware", "kitchenware", "personal care"]):
+            intent = Intent.UNKNOWN
+        elif any(k in lower for k in ["plan a party", "party", "birthday", "wedding", "event"]):
+            intent = Intent.PLAN_EVENT
+        elif any(k in lower for k in ["add all", "add everything", "go ahead", "proceed", "checkout"]):
+            intent = Intent.CONFIRM_ADD_TO_CART
+        else:
+            intent = Intent.UNKNOWN
+
+        # missing slots: only the essentials for our current external flow
+        missing: List[str] = []
+        party_size = slots.get("party_size") or current_plan.party_size
+        location = slots.get("location") or current_plan.location
+        if not party_size:
+            missing.append("party_size")
+        if party_size and not location:
+            missing.append("location")
+
+        return {"intent": intent, "slots": slots, "missing_slots": missing}
 
     def extract_intent_and_slots(
         self,
@@ -128,9 +182,12 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ],
         }
-        resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=120)
-        resp.raise_for_status()
-        raw = _parse_llm_response(resp)
+        try:
+            resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=30)
+            resp.raise_for_status()
+            raw = _parse_llm_response(resp)
+        except RequestException:
+            return self._heuristic_extract(user_message, current_plan)
 
         if not raw:
             return {

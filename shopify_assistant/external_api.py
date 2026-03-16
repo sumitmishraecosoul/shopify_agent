@@ -72,6 +72,55 @@ def _build_cart_permalink(cart_items: List[dict]) -> str | None:
     return f"{domain}/cart/{','.join(parts)}"
 
 
+def _normalize_cart_items(items: List[dict]) -> List[dict]:
+    """
+    Normalize items to: [{id: <numeric-or-string>, quantity: int>=1}]
+    """
+    out: List[dict] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        vid = it.get("id")
+        if vid is None:
+            continue
+        vid_s = str(vid).strip()
+        if not vid_s:
+            continue
+        qty = int(it.get("quantity", 1) or 1)
+        out.append({"id": int(vid_s) if vid_s.isdigit() else vid_s, "quantity": max(1, qty)})
+    return out
+
+
+def _merge_cart_items(existing: List[dict], incoming: List[dict], action: str = "add") -> List[dict]:
+    """
+    Merge cart items for demo session cart state.
+    - action=add: adds quantities
+    - action=set|update: sets quantities
+    - action=remove|delete: removes matching ids
+    """
+    action_l = (action or "add").lower().strip()
+    base = _normalize_cart_items(existing)
+    inc = _normalize_cart_items(incoming)
+
+    idx: dict[str, int] = {str(it["id"]): i for i, it in enumerate(base)}
+
+    if action_l in ("remove", "delete"):
+        remove_ids = {str(it["id"]) for it in inc}
+        return [it for it in base if str(it["id"]) not in remove_ids]
+
+    for it in inc:
+        key = str(it["id"])
+        if key in idx:
+            if action_l in ("set", "update"):
+                base[idx[key]]["quantity"] = max(1, int(it["quantity"]))
+            else:  # add
+                base[idx[key]]["quantity"] = max(1, int(base[idx[key]]["quantity"]) + int(it["quantity"]))
+        else:
+            base.append({"id": it["id"], "quantity": max(1, int(it["quantity"]))})
+            idx[key] = len(base) - 1
+    return base
+
+
 def _category_menu_quick_replies() -> List[str]:
     return ["Tableware", "Drinkware", "Kitchenware", "Personal care"]
 
@@ -129,6 +178,82 @@ def _infer_leaf_category_from_subcategory(category: str, subcategory: str) -> st
             return "cups"
     # Fallback: no strict mapping; search will still work by keyword
     return None
+
+
+def _infer_party_item_category(lower: str) -> str | None:
+    """
+    Map a user phrase to an inventory leaf category.
+    Used for "show different plates/bowls/cups" style requests.
+    """
+    if any(w in lower for w in ["plate", "plates"]):
+        return "plates"
+    if any(w in lower for w in ["bowl", "bowls"]):
+        return "bowls"
+    if any(w in lower for w in ["cup", "cups", "glass", "glasses", "straw", "straws"]):
+        return "cups"
+    if any(w in lower for w in ["spoon", "spoons", "cutlery"]):
+        return "spoons"
+    if any(w in lower for w in ["fork", "forks"]):
+        return "forks"
+    return None
+
+
+def _build_product_list_payload(
+    *,
+    message: str,
+    leaf_category: str,
+    subcategory_label: str,
+    quick_replies: List[str] | None = None,
+) -> tuple[ExternalChatPayload, ExternalConversationContext]:
+    alt_products = clickhouse_client.fetch_products_for_category(category=leaf_category, eco_preference="high")
+    cards: List[ExternalProductCard] = []
+    for p in alt_products[:10]:
+        price = (int(p.get("price_cents", 0)) or 0) / 100.0
+        pack_size = int(p.get("pack_size", 1) or 1)
+        cards.append(
+            ExternalProductCard(
+                product_id=str(p.get("product_gid") or p.get("product_id") or ""),
+                variant_id=_gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or "")),
+                title=p.get("title", ""),
+                description=f"Alternative {subcategory_label.lower()} option from our catalog.",
+                price=price,
+                currency="USD",
+                image_url=None,
+                product_url=f"/products/{p.get('handle','')}",
+                badges=["eco-friendly"],
+                options=[],
+                selected_options={},
+                quantity=1,
+                pack_size=pack_size,
+                packs_recommended=1,
+                total_units=pack_size,
+                key_benefits=[],
+                statistics=None,
+            )
+        )
+
+    payload = ExternalChatPayload(
+        message=message,
+        type="product_list",
+        suggested_products=cards,
+        cart_items=[],
+        cart_permalink=_build_cart_permalink(
+            [{"id": int(c.variant_id) if str(c.variant_id).isdigit() else c.variant_id, "quantity": 1} for c in cards[:6] if c.variant_id]
+        ),
+        quick_replies=quick_replies or ["Plan a party", "Browse products"],
+    )
+    ctx = ExternalConversationContext(
+        detected_intent=Intent.ADJUST_PLAN.value,
+        detected_disposables=[],
+        party_size=None,
+        estimated_coverage={},
+        products_discussed=[c.product_id for c in cards],
+        pending_actions=[],
+        mode=ConversationMode.PRODUCT_BROWSING,
+        current_category="tableware" if leaf_category in ("plates", "bowls", "spoons", "forks") else "drinkware",
+        current_subcategory=subcategory_label,
+    )
+    return payload, ctx
 
 
 def _basket_edit_apply(message_lower: str, basket: BasketRecommendation) -> BasketRecommendation:
@@ -301,61 +426,24 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
     text = (request.message or "").strip()
     lower = text.lower()
 
-    # Special case: user asking for different plate options after a party recommendation
-    if (
-        session.mode == ConversationMode.PARTY_PLANNING
-        and session.last_basket
-        and any(kw in lower for kw in ["different plates", "different plate", "other plates", "more plate", "more plates", "show more options"])
+    # Special case: user asking for different options after a party recommendation
+    if session.mode == ConversationMode.PARTY_PLANNING and session.last_basket and any(
+        w in lower for w in ["different", "other", "more options", "show options", "show more options"]
     ):
-        # Show a broader list of plate products as alternatives
-        alt_products = clickhouse_client.fetch_products_for_category(category="plates", eco_preference="high")
-        cards: List[ExternalProductCard] = []
-        for p in alt_products[:10]:
-            price = (int(p.get("price_cents", 0)) or 0) / 100.0
-            pack_size = int(p.get("pack_size", 1) or 1)
-            cards.append(
-                ExternalProductCard(
-                    product_id=str(p.get("product_gid") or p.get("product_id") or ""),
-                    variant_id=_gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or "")),
-                    title=p.get("title", ""),
-                    description="Alternative plate option from our catalog.",
-                    price=price,
-                    currency="USD",
-                    image_url=None,
-                    product_url=f"/products/{p.get('handle','')}",
-                    badges=["eco-friendly"],
-                    options=[],
-                    selected_options={},
-                    quantity=1,
-                    pack_size=pack_size,
-                    packs_recommended=1,
-                    total_units=pack_size,
-                    key_benefits=[],
-                    statistics=None,
-                )
+        leaf = _infer_party_item_category(lower)
+        if leaf:
+            label = leaf.title() if leaf != "cups" else "Cups"
+            payload, ctx = _build_product_list_payload(
+                message=f"Here are some other {label.lower()} options you can consider:",
+                leaf_category=leaf,
+                subcategory_label=label,
+                quick_replies=["Back to party plan", "Browse products"],
             )
-        payload = ExternalChatPayload(
-            message="Here are some other plate options you can consider for dinner or main courses:",
-            type="product_list",
-            suggested_products=cards,
-            cart_items=[],
-            cart_permalink=_build_cart_permalink(
-                [{"id": int(c.variant_id) if str(c.variant_id).isdigit() else c.variant_id, "quantity": 1} for c in cards[:6] if c.variant_id]
-            ),
-            quick_replies=["Plan a party", "Browse products"],
-        )
-        ctx = ExternalConversationContext(
-            detected_intent=Intent.ADJUST_PLAN.value,
-            detected_disposables=session.party_plan.disposables_needed or [],
-            party_size=session.party_plan.party_size,
-            estimated_coverage=session.last_basket.estimated_coverage,
-            products_discussed=[c.product_id for c in cards],
-            pending_actions=[],
-            mode=ConversationMode.PRODUCT_BROWSING,
-            current_category="tableware",
-            current_subcategory="Plates",
-        )
-        return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
+            # carry over party context
+            ctx.party_size = session.party_plan.party_size
+            ctx.detected_disposables = session.party_plan.disposables_needed or []
+            ctx.estimated_coverage = session.last_basket.estimated_coverage
+            return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
 
     # Mode selection by keywords (must happen before any welcome return)
     if any(kw in lower for kw in ["plan a party", "party", "birthday"]):
@@ -369,6 +457,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             message="Hi! I'm your EcoSoul assistant. Would you like to plan a party or browse products?",
             type="welcome",
             suggested_products=[],
+            cart_items=session.cart_items or [],
+            cart_permalink=_build_cart_permalink(session.cart_items or []),
             quick_replies=["Plan a party", "Browse products"],
             suggested_questions=[
                 "Help me plan a birthday party",
@@ -498,29 +588,33 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             if str(s).lower() not in ("eco_preference", "budget_per_person")
         ]
 
-        if intent == Intent.SMALL_TALK or intent == Intent.UNKNOWN or (missing_slots and not session.party_plan.party_size):
-            payload = ExternalChatPayload(
-                message="Hi! I'm your EcoSoul party planning assistant. How many guests are you expecting?",
-                type="question",
-                suggested_products=[],
-                quick_replies=["10 guests", "25 guests", "50 guests", "More than 100"],
-                suggested_questions=[
-                    "What products do you recommend?",
-                    "Tell me about eco-friendly options",
-                ],
-            )
-            ctx = ExternalConversationContext(
-                detected_intent=intent.value if isinstance(intent, Intent) else str(intent),
-                detected_disposables=session.party_plan.disposables_needed or [],
-                party_size=session.party_plan.party_size,
-                estimated_coverage={},
-                products_discussed=[],
-                pending_actions=[],
-                mode=session.mode,
-                current_category=session.current_category,
-                current_subcategory=session.current_subcategory,
-            )
-            return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
+        # If we STILL don't know party_size, prioritize asking that first.
+        if not session.party_plan.party_size:
+            if intent == Intent.SMALL_TALK or intent == Intent.UNKNOWN or missing_slots:
+                payload = ExternalChatPayload(
+                    message="Hi! I'm your EcoSoul party planning assistant. How many guests are you expecting?",
+                    type="question",
+                    suggested_products=[],
+                    cart_items=session.cart_items or [],
+                    cart_permalink=_build_cart_permalink(session.cart_items or []),
+                    quick_replies=["10 guests", "25 guests", "50 guests", "More than 100"],
+                    suggested_questions=[
+                        "What products do you recommend?",
+                        "Tell me about eco-friendly options",
+                    ],
+                )
+                ctx = ExternalConversationContext(
+                    detected_intent=intent.value if isinstance(intent, Intent) else str(intent),
+                    detected_disposables=session.party_plan.disposables_needed or [],
+                    party_size=session.party_plan.party_size,
+                    estimated_coverage={},
+                    products_discussed=[],
+                    pending_actions=[],
+                    mode=session.mode,
+                    current_category=session.current_category,
+                    current_subcategory=session.current_subcategory,
+                )
+                return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
 
         recommendation = build_recommendation(session.party_plan)
         if not recommendation:
@@ -625,6 +719,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             message="What category would you like to explore?",
             type="category_menu",
             suggested_products=[],
+            cart_items=session.cart_items or [],
+            cart_permalink=_build_cart_permalink(session.cart_items or []),
             quick_replies=_category_menu_quick_replies(),
         )
         ctx = ExternalConversationContext(
@@ -651,6 +747,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
                 message=f"What type of {session.current_category} are you looking for?",
                 type="subcategory_menu",
                 suggested_products=[],
+                cart_items=session.cart_items or [],
+                cart_permalink=_build_cart_permalink(session.cart_items or []),
                 quick_replies=subs[:6],
             )
             ctx = ExternalConversationContext(
@@ -709,8 +807,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
         message=f"Here are some {session.current_subcategory or 'products'} you can explore:",
         type="product_list",
         suggested_products=cards,
-        cart_items=[],
-        cart_permalink=cart_permalink,
+        cart_items=session.cart_items or [],
+        cart_permalink=_build_cart_permalink(session.cart_items or []) or cart_permalink,
         quick_replies=["Show more products", "Different category", "Plan a party"],
     )
     ctx = ExternalConversationContext(
@@ -733,6 +831,9 @@ def external_cart_add(request: ExternalCartAddRequest) -> ExternalCartAddRespons
     Add items to Shopify cart. If cart_token is sent (from browser cookie or GET /cart.js),
     or SHOPIFY_CART_TOKEN is set in .env, items are added via Shopify Ajax API. Otherwise returns a stub response.
     """
+    session = _get_or_create_session(request.session_id)
+    session.cart_items = _merge_cart_items(session.cart_items or [], request.items or [], action=request.cart_action or "add")
+
     cart_token = request.cart_token or settings.SHOPIFY_CART_TOKEN
     if cart_token and request.items:
         ok, cart_info, msg = shopify_client.add_items_via_ajax(request.items, cart_token)
@@ -748,7 +849,7 @@ def external_cart_add(request: ExternalCartAddRequest) -> ExternalCartAddRespons
             )
         return ExternalCartAddResponse(success=False, cart={}, message=msg, next_suggestions=[])
 
-    items_count = sum(int(i.get("quantity", 1)) for i in request.items)
+    items_count = sum(int(i.get("quantity", 1)) for i in (session.cart_items or []))
     domain = (settings.SHOPIFY_STORE_DOMAIN or "https://yourstore.com").rstrip("/")
     cart = {
         "cart_id": "placeholder-cart-id",
@@ -756,9 +857,10 @@ def external_cart_add(request: ExternalCartAddRequest) -> ExternalCartAddRespons
         "checkout_url": f"{domain}/checkout",
         "items_count": items_count,
         "total_price": 0.0,
-        "items": request.items,
+        "items": session.cart_items or [],
+        "cart_permalink": _build_cart_permalink(session.cart_items or []),
     }
-    msg = f"Added {items_count} item(s) to your cart (send cart_token to add to real Shopify cart)."
+    msg = "Updated cart (send cart_token to add to real Shopify cart)."
     return ExternalCartAddResponse(success=True, cart=cart, message=msg, next_suggestions=[])
 
 
@@ -767,6 +869,9 @@ def external_cart_add_multiple(request: ExternalCartAddMultipleRequest) -> Exter
     """
     Add multiple items at once (e.g. full party set). Uses cart_token from body or SHOPIFY_CART_TOKEN in .env.
     """
+    session = _get_or_create_session(request.session_id)
+    session.cart_items = _merge_cart_items(session.cart_items or [], request.items or [], action="add")
+
     cart_token = request.cart_token or settings.SHOPIFY_CART_TOKEN
     if cart_token and request.items:
         ok, cart_info, msg = shopify_client.add_items_via_ajax(request.items, cart_token)
@@ -782,7 +887,7 @@ def external_cart_add_multiple(request: ExternalCartAddMultipleRequest) -> Exter
             )
         return ExternalCartAddResponse(success=False, cart={}, message=msg, next_suggestions=[])
 
-    items_count = sum(int(i.get("quantity", 1)) for i in request.items)
+    items_count = sum(int(i.get("quantity", 1)) for i in (session.cart_items or []))
     domain = (settings.SHOPIFY_STORE_DOMAIN or "https://yourstore.com").rstrip("/")
     cart = {
         "cart_id": "placeholder-cart-id",
@@ -790,9 +895,10 @@ def external_cart_add_multiple(request: ExternalCartAddMultipleRequest) -> Exter
         "checkout_url": f"{domain}/checkout",
         "items_count": items_count,
         "total_price": 0.0,
-        "items": request.items,
+        "items": session.cart_items or [],
+        "cart_permalink": _build_cart_permalink(session.cart_items or []),
     }
-    msg = f"Added complete party set ({items_count} item(s)) (send cart_token to add to real Shopify cart)."
+    msg = "Updated cart (send cart_token to add to real Shopify cart)."
     return ExternalCartAddResponse(success=True, cart=cart, message=msg, next_suggestions=[])
 
 
