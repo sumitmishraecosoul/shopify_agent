@@ -198,6 +198,15 @@ def _infer_party_item_category(lower: str) -> str | None:
     return None
 
 
+def _out_of_stock_message(category_label: str) -> str:
+    """Message when user asks for a specific product/category but inventory is unavailable."""
+    return (
+        f"Currently for {category_label.lower()} inventory is out of stock. "
+        "Please check after sometime for this product if you want to buy it. "
+        "Till then please explore our other products—or I can help you explore other products; just ask me."
+    )
+
+
 def _build_product_list_payload(
     *,
     message: str,
@@ -207,6 +216,27 @@ def _build_product_list_payload(
 ) -> tuple[ExternalChatPayload, ExternalConversationContext]:
     alt_products = clickhouse_client.fetch_products_for_category(category=leaf_category, eco_preference="high")
     cards: List[ExternalProductCard] = []
+    if not alt_products:
+        payload = ExternalChatPayload(
+            message=_out_of_stock_message(subcategory_label),
+            type="product_list",
+            suggested_products=[],
+            cart_items=[],
+            cart_permalink="",
+            quick_replies=quick_replies or ["Explore other products", "Plan a party", "Browse products"],
+        )
+        ctx = ExternalConversationContext(
+            detected_intent=Intent.ADJUST_PLAN.value,
+            detected_disposables=[],
+            party_size=None,
+            estimated_coverage={},
+            products_discussed=[],
+            pending_actions=[],
+            mode=ConversationMode.PRODUCT_BROWSING,
+            current_category="tableware" if leaf_category in ("plates", "bowls", "spoons", "forks") else "drinkware",
+            current_subcategory=subcategory_label,
+        )
+        return payload, ctx
     for p in alt_products[:10]:
         price = (int(p.get("price_cents", 0)) or 0) / 100.0
         pack_size = int(p.get("pack_size", 1) or 1)
@@ -568,7 +598,14 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             if v is None or k in ("eco_preference", "budget_per_person"):
                 continue
             if k == "disposables_needed" and isinstance(v, list):
-                updated_plan_data[k] = ["cups" if str(x).lower() in ("glasses", "cups") else str(x).lower() for x in v]
+                def _norm_disposable(x: str) -> str:
+                    s = str(x).lower()
+                    if s in ("glasses", "cups"):
+                        return "cups"
+                    if s in ("cutlery", "spoon"):
+                        return "spoons"
+                    return s
+                updated_plan_data[k] = [_norm_disposable(x) for x in v]
             elif k in ("plates_per_person", "spoons_per_person", "bowls_per_person", "cups_per_person", "party_size"):
                 try:
                     updated_plan_data[k] = int(v)
@@ -803,14 +840,26 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
 
     cart_items = [{"id": int(c.variant_id) if str(c.variant_id).isdigit() else c.variant_id, "quantity": 1} for c in cards if c.variant_id]
     cart_permalink = _build_cart_permalink(cart_items[:6])  # keep it short for browsing
-    payload = ExternalChatPayload(
-        message=f"Here are some {session.current_subcategory or 'products'} you can explore:",
-        type="product_list",
-        suggested_products=cards,
-        cart_items=session.cart_items or [],
-        cart_permalink=_build_cart_permalink(session.cart_items or []) or cart_permalink,
-        quick_replies=["Show more products", "Different category", "Plan a party"],
-    )
+    subcategory_label = session.current_subcategory or "products"
+    if not cards:
+        # User asked for a specific category (e.g. Cutlery) but no inventory available
+        payload = ExternalChatPayload(
+            message=_out_of_stock_message(subcategory_label),
+            type="product_list",
+            suggested_products=[],
+            cart_items=session.cart_items or [],
+            cart_permalink=_build_cart_permalink(session.cart_items or []),
+            quick_replies=["Explore other products", "Different category", "Plan a party"],
+        )
+    else:
+        payload = ExternalChatPayload(
+            message=f"Here are some {subcategory_label} you can explore:",
+            type="product_list",
+            suggested_products=cards,
+            cart_items=session.cart_items or [],
+            cart_permalink=_build_cart_permalink(session.cart_items or []) or cart_permalink,
+            quick_replies=["Show more products", "Different category", "Plan a party"],
+        )
     ctx = ExternalConversationContext(
         detected_intent=Intent.UNKNOWN.value,
         detected_disposables=session.party_plan.disposables_needed or [],

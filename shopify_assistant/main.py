@@ -62,7 +62,14 @@ def chat(request: ChatRequest) -> ChatResponse:
         if v is None or k in ("eco_preference", "budget_per_person"):
             continue
         if k == "disposables_needed" and isinstance(v, list):
-            updated_plan_data[k] = ["cups" if str(x).lower() in ("glasses", "cups") else str(x).lower() for x in v]
+            def _norm_disposable(x: str) -> str:
+                s = str(x).lower()
+                if s in ("glasses", "cups"):
+                    return "cups"
+                if s in ("cutlery", "spoon"):
+                    return "spoons"
+                return s
+            updated_plan_data[k] = [_norm_disposable(x) for x in v]
         elif k in ("plates_per_person", "spoons_per_person", "bowls_per_person", "cups_per_person", "party_size"):
             try:
                 updated_plan_data[k] = int(v)

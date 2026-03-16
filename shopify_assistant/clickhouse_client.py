@@ -37,12 +37,13 @@ class ClickHouseClient:
                 product_type = product.get("productType") or ""
 
                 # Derive a coarse category from product type / title
+                # Cutlery and spoon mean the same; we show "cutlery" on site but use "spoons" internally
                 text_for_cat = f"{product_type} {title}".lower()
                 if "plate" in text_for_cat:
                     category = "plates"
                 elif "bowl" in text_for_cat:
                     category = "bowls"
-                elif "spoon" in text_for_cat:
+                elif "spoon" in text_for_cat or "cutlery" in text_for_cat:
                     category = "spoons"
                 elif "fork" in text_for_cat:
                     category = "forks"
