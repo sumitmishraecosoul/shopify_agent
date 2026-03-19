@@ -160,6 +160,13 @@ def main() -> None:
                     c_info, c_qty, c_actions = st.columns([3, 2, 2])
 
                     with c_info:
+                        img = p.get("image_url") or ""
+                        if isinstance(img, str) and img.strip():
+                            try:
+                                st.image(img, use_container_width=True)
+                            except Exception:
+                                # If Streamlit can't render the image (bad URL / SSL), still show the link.
+                                st.caption(img)
                         st.markdown(f"**{title}**")
                         if price is not None:
                             st.caption(f"Price: ${price:.2f}")

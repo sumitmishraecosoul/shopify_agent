@@ -16,7 +16,11 @@ class ClickHouseClient:
 
     def __init__(self) -> None:
         base_dir = Path(__file__).resolve().parent
-        json_path = base_dir / "us_shopify_inventory1.json"
+        # Prefer the newer export that includes featuredImage.url (for UI images).
+        json_path_v3 = base_dir / "us_shopify_inventory3.json"
+        json_path_v1 = base_dir / "us_shopify_inventory1.json"
+        json_path = json_path_v3 if json_path_v3.exists() else json_path_v1
+
         if not json_path.exists():
             self._products: List[Dict[str, Any]] = []
             return
@@ -35,6 +39,9 @@ class ClickHouseClient:
                 title = product.get("title") or ""
                 variant_title = variant.get("title") or ""
                 product_type = product.get("productType") or ""
+                featured_image = product.get("featuredImage") or {}
+                image_url = featured_image.get("url") or None
+                image_alt = featured_image.get("altText") or None
 
                 # Derive a coarse category from product type / title
                 # Cutlery and spoon mean the same; we show "cutlery" on site but use "spoons" internally
@@ -98,6 +105,8 @@ class ClickHouseClient:
                         "price_cents": price_cents,
                         "tags": [product_type],
                         "available": available,
+                        "image_url": image_url,
+                        "image_alt": image_alt,
                     }
                 )
 
