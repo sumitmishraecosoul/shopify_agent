@@ -17,6 +17,8 @@ from .llm_client import llm_client
 from .engine import build_recommendation
 from .shopify_client import shopify_client
 from .external_api import router as external_router
+from .external_auth_api import router as external_auth_router
+from .inventory_api import router as inventory_router
 
 # In-memory session store for v1 (can be moved to ClickHouse/Redis later)
 SESSIONS: dict[str, SessionState] = {}
@@ -33,7 +35,9 @@ app.add_middleware(
 )
 
 # External, Shopify-facing API (L'Occitane-style responses)
+app.include_router(external_auth_router)
 app.include_router(external_router)
+app.include_router(inventory_router)
 
 
 def _get_or_create_session(session_id: str) -> SessionState:

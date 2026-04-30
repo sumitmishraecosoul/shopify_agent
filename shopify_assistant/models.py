@@ -30,6 +30,8 @@ class ConversationMode(str, Enum):
     PARTY_PLANNING = "PARTY_PLANNING"
     PRODUCT_BROWSING = "PRODUCT_BROWSING"
     PRODUCT_SEARCH = "PRODUCT_SEARCH"
+    # Marketing / sales: curated product sets by campaign or event type
+    EVENT_CAMPAIGN = "EVENT_CAMPAIGN"
 
 
 class PartyPlan(BaseModel):
@@ -75,6 +77,8 @@ class SessionState(BaseModel):
     mode: Optional[ConversationMode] = None
     current_category: Optional[str] = None
     current_subcategory: Optional[str] = None
+    # Active preset campaign id when in EVENT_CAMPAIGN (e.g. summer_bbq)
+    campaign_id: Optional[str] = None
     # Persisted cart payload for demo / Shopify integration (numeric variant ids)
     cart_items: List[Dict[str, Any]] = []
 
@@ -129,6 +133,9 @@ class ExternalProductCard(BaseModel):
     selected_options: Dict[str, str] = {}
     # Recommendation-specific fields
     quantity: int = 1  # packs to add
+    # Per-product Shopify-ready cart payload for individual add-to-cart.
+    # Example: {"id": 45006975795353, "quantity": 2}
+    cart_item: Optional[Dict[str, Any]] = None
     pack_size: int
     packs_recommended: int
     total_units: int
@@ -152,6 +159,8 @@ class ExternalChatPayload(BaseModel):
     message: str
     type: str
     suggested_products: List[ExternalProductCard] = []
+    # Separate "you may also like" style product cards.
+    additional_recommendations: List[ExternalProductCard] = []
     # Shopify cart payload-ready items (numeric variant ids)
     cart_items: List[Dict[str, Any]] = []
     # Optional one-click cart URL
@@ -214,4 +223,15 @@ class ExternalSessionResponse(BaseModel):
     session_id: str
     customer_info: Optional[Dict[str, Any]] = None
     conversation_summary: Dict[str, Any]
+
+
+class AuthLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthLoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
 

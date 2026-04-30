@@ -1,6 +1,6 @@
-from typing import List
+from typing import Any, Dict, List
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 import re
 
@@ -28,9 +28,60 @@ from .models import (
     SessionState,
 )
 from .shopify_client import shopify_client
+from .auth import require_bearer_token
 
 
-router = APIRouter(prefix="/api/v1", tags=["external"])
+router = APIRouter(prefix="/api/v1", tags=["external"], dependencies=[Depends(require_bearer_token)])
+
+# Branding — assistant intelligence name + voice
+ASSISTANT_NAME = "Verdant"
+ASSISTANT_TAGLINE = "EcoSoul Intelligence"
+
+# Preset campaigns for marketing & sales (expand or load from CMS later)
+EVENT_CAMPAIGNS: List[Dict[str, Any]] = [
+    {
+        "id": "summer_bbq",
+        "label": "Summer BBQ & outdoor",
+        "headline": "Alfresco feasts",
+        "aliases": ["bbq", "barbecue", "outdoor", "picnic", "grill"],
+        "queries": ["plate", "cup", "bowl", "straw"],
+    },
+    {
+        "id": "wedding",
+        "label": "Wedding & celebrations",
+        "headline": "Elevated gatherings",
+        "aliases": ["wedding", "reception", "celebration", "anniversary"],
+        "queries": ["palm plate", "cup", "bowl", "compostable plate"],
+    },
+    {
+        "id": "corporate",
+        "label": "Corporate catering",
+        "headline": "Office & client events",
+        "aliases": ["corporate", "office", "catering", "lunch"],
+        "queries": ["plate", "cup", "cutlery", "spoon"],
+    },
+    {
+        "id": "earth_day",
+        "label": "Earth Day & sustainability",
+        "headline": "Planet-first storytelling",
+        "aliases": ["earth", "sustainability", "eco drive", "green"],
+        "queries": ["compostable", "bamboo", "palm leaf", "bagasse"],
+    },
+    {
+        "id": "trade_show",
+        "label": "Trade show & expo",
+        "headline": "Booth-ready essentials",
+        "aliases": ["expo", "trade show", "booth", "conference"],
+        "queries": ["cold cup", "ripple", "straw", "sample"],
+    },
+    {
+        "id": "festival",
+        "label": "Festival & large crowd",
+        "headline": "High-volume hosting",
+        "aliases": ["festival", "concert", "crowd", "large event"],
+        "queries": ["plate", "cup", "bowl", "fork"],
+    },
+]
 
 # Simple in-memory session store for the external API layer
 EXTERNAL_SESSIONS: dict[str, SessionState] = {}
@@ -207,6 +258,303 @@ def _out_of_stock_message(category_label: str) -> str:
     )
 
 
+def _event_campaign_menu_quick_replies() -> List[str]:
+    return [c["label"] for c in EVENT_CAMPAIGNS] + [
+        "Describe my campaign",
+        "Plan a party",
+        "Browse products",
+    ]
+
+
+def _match_event_campaign(text: str) -> Dict[str, Any] | None:
+    t = text.strip().lower()
+    for c in EVENT_CAMPAIGNS:
+        if str(c.get("label", "")).lower() == t:
+            return c
+        for a in c.get("aliases", []) or []:
+            al = str(a).lower()
+            if not al:
+                continue
+            if t == al or (len(al) >= 4 and al in t):
+                return c
+    return None
+
+
+def _merge_campaign_inventory(queries: List[str], limit: int = 10) -> List[dict]:
+    seen: set[str] = set()
+    out: List[dict] = []
+    for q in queries:
+        for p in clickhouse_client.search_products(query=q, category=None, limit=4):
+            key = _gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _dict_products_to_cards(products: List[dict], description: str = "EcoSoul product") -> List[ExternalProductCard]:
+    cards: List[ExternalProductCard] = []
+    for p in products:
+        price = (int(p.get("price_cents", 0)) or 0) / 100.0
+        pack_size = int(p.get("pack_size", 1) or 1)
+        variant_numeric = _gid_to_numeric_id(str(p.get("variant_gid") or ""))
+        item_id = int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric
+        cards.append(
+            ExternalProductCard(
+                product_id=str(p.get("product_gid") or p.get("product_id") or ""),
+                variant_id=variant_numeric or str(p.get("variant_gid") or p.get("product_id") or ""),
+                title=p.get("title", ""),
+                description=description,
+                price=price,
+                currency="USD",
+                image_url=p.get("image_url") or None,
+                product_url=f"/products/{p.get('handle','')}",
+                badges=["campaign-pick", "eco-friendly"],
+                options=[],
+                selected_options={},
+                quantity=1,
+                cart_item={"id": item_id, "quantity": 1} if variant_numeric else None,
+                pack_size=pack_size,
+                packs_recommended=1,
+                total_units=pack_size,
+                key_benefits=[],
+                statistics=None,
+            )
+        )
+    return cards
+
+
+def _handle_event_campaign_flow(session: SessionState, session_id: str, text: str, lower: str) -> ExternalChatResponse:
+    cart_items = session.cart_items or []
+    cart_permalink = _build_cart_permalink(cart_items)
+
+    def _ctx(**kwargs: Any) -> ExternalConversationContext:
+        return ExternalConversationContext(
+            detected_intent=kwargs.get("detected_intent"),
+            detected_disposables=session.party_plan.disposables_needed or [],
+            party_size=session.party_plan.party_size,
+            estimated_coverage=kwargs.get("estimated_coverage") or {},
+            products_discussed=kwargs.get("products_discussed") or [],
+            pending_actions=kwargs.get("pending_actions") or [],
+            mode=session.mode,
+            current_category=session.current_category,
+            current_subcategory=session.current_subcategory,
+        )
+
+    if any(kw in lower for kw in ["plan a party", "party plan"]):
+        session.mode = ConversationMode.PARTY_PLANNING
+        session.campaign_id = None
+        payload = ExternalChatPayload(
+            message=(
+                f"Perfect — **{ASSISTANT_NAME}** will shape a disposable lineup for your gathering. "
+                "About how many guests should we plan for?"
+            ),
+            type="question",
+            suggested_products=[],
+            cart_items=cart_items,
+            cart_permalink=cart_permalink,
+            quick_replies=["10 guests", "25 guests", "50 guests", "More than 100"],
+        )
+        return ExternalChatResponse(success=True, session_id=session_id, response=payload, conversation_context=_ctx())
+
+    if any(kw in lower for kw in ["browse products", "browse catalog", "shop catalog"]):
+        session.mode = ConversationMode.PRODUCT_BROWSING
+        session.campaign_id = None
+        session.current_category = None
+        session.current_subcategory = None
+        payload = ExternalChatPayload(
+            message="Browse by category — I’ll pull the strongest eco-forward options from each aisle.",
+            type="category_menu",
+            suggested_products=[],
+            cart_items=cart_items,
+            cart_permalink=cart_permalink,
+            quick_replies=_category_menu_quick_replies(),
+        )
+        return ExternalChatResponse(success=True, session_id=session_id, response=payload, conversation_context=_ctx())
+
+    matched = _match_event_campaign(text)
+    if matched:
+        session.campaign_id = str(matched["id"])
+        raw = _merge_campaign_inventory(list(matched.get("queries") or []), limit=10)
+        if not raw:
+            payload = ExternalChatPayload(
+                message=(
+                    f"I couldn’t build a tray for **{matched['label']}** from current inventory. "
+                    "Try **Describe my campaign** with a short phrase, or pick another preset."
+                ),
+                type="event_campaign_menu",
+                suggested_products=[],
+                additional_recommendations=[],
+                cart_items=cart_items,
+                cart_permalink=cart_permalink,
+                quick_replies=_event_campaign_menu_quick_replies(),
+            )
+            return ExternalChatResponse(success=True, session_id=session_id, response=payload, conversation_context=_ctx())
+
+        cards = _dict_products_to_cards(raw, description=f"Curated for {matched['label']}")
+        payload = ExternalChatPayload(
+            message=(
+                f"**{matched.get('headline', 'Campaign picks')}** — starter assortment for **{matched['label']}**. "
+                "Adjust packs or explore add-ons below."
+            ),
+            type="product_list",
+            suggested_products=cards,
+            additional_recommendations=_build_additional_recommendations(raw, limit=6),
+            cart_items=cart_items,
+            cart_permalink=cart_permalink,
+            quick_replies=["Event plan", "Plan a party", "Browse products", "Different category"],
+        )
+        return ExternalChatResponse(
+            success=True,
+            session_id=session_id,
+            response=payload,
+            conversation_context=_ctx(products_discussed=[c.product_id for c in cards]),
+        )
+
+    if "describe my campaign" in lower:
+        payload = ExternalChatPayload(
+            message=(
+                "In one line, describe what you’re promoting — e.g. *hotel turndown kits*, *retail Christmas*, *office lunch week*. "
+                f"I’ll map it to products we carry."
+            ),
+            type="question",
+            suggested_products=[],
+            cart_items=cart_items,
+            cart_permalink=cart_permalink,
+            quick_replies=_event_campaign_menu_quick_replies(),
+        )
+        return ExternalChatResponse(success=True, session_id=session_id, response=payload, conversation_context=_ctx())
+
+    if len(text.strip()) >= 3 and lower not in ("event plan", "event campaign", "marketing campaign"):
+        custom = clickhouse_client.search_products(query=text, category=None, limit=10)
+        if custom:
+            session.campaign_id = None
+            cards = _dict_products_to_cards(custom, description="Matched to your campaign brief")
+            payload = ExternalChatPayload(
+                message=f"Here’s what aligns with **{text.strip()}** in our catalog right now:",
+                type="product_list",
+                suggested_products=cards,
+                additional_recommendations=_build_additional_recommendations(custom, limit=6),
+                cart_items=cart_items,
+                cart_permalink=cart_permalink,
+                quick_replies=["Event plan", "Plan a party", "Browse products"],
+            )
+            return ExternalChatResponse(
+                success=True,
+                session_id=session_id,
+                response=payload,
+                conversation_context=_ctx(products_discussed=[c.product_id for c in cards]),
+            )
+
+    session.campaign_id = None
+    payload = ExternalChatPayload(
+        message=(
+            f"I'm **{ASSISTANT_NAME}**, **{ASSISTANT_TAGLINE}**. "
+            "Choose the **event or campaign** you’re running — I’ll shortlist products for merchandising. "
+            "Or type your own brief (one short line)."
+        ),
+        type="event_campaign_menu",
+        suggested_products=[],
+        cart_items=cart_items,
+        cart_permalink=cart_permalink,
+        quick_replies=_event_campaign_menu_quick_replies(),
+    )
+    return ExternalChatResponse(success=True, session_id=session_id, response=payload, conversation_context=_ctx())
+
+
+def _build_additional_recommendations(
+    primary_products: List[dict],
+    limit: int = 6,
+    max_categories: int = 3,
+    per_category_limit: int = 2,
+) -> List[ExternalProductCard]:
+    """
+    Build "you may also like" cards from related categories.
+    """
+    if not primary_products:
+        return []
+
+    related_category_map: dict[str, List[str]] = {
+        "plates": ["cups", "bowls", "spoons", "forks"],
+        "bowls": ["plates", "cups", "spoons"],
+        "cups": ["plates", "bowls", "spoons"],
+        "spoons": ["plates", "bowls", "cups"],
+        "forks": ["plates", "bowls", "cups"],
+        "other": ["plates", "cups", "bowls", "spoons"],
+    }
+
+    seed_categories: List[str] = []
+    seen_variant_keys: set[str] = set()
+    for p in primary_products:
+        cat = str(p.get("category") or "").strip().lower()
+        if cat:
+            seed_categories.append(cat)
+        v = _gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or ""))
+        if v:
+            seen_variant_keys.add(str(v))
+
+    target_categories: List[str] = []
+    for cat in seed_categories:
+        for rel in related_category_map.get(cat, ["plates", "cups", "bowls", "spoons"]):
+            if rel not in target_categories and rel not in seed_categories:
+                target_categories.append(rel)
+    for fallback in ["plates", "cups", "bowls", "spoons", "forks"]:
+        if fallback not in target_categories and fallback not in seed_categories:
+            target_categories.append(fallback)
+
+    cards: List[ExternalProductCard] = []
+    used_category_count = 0
+    for cat in target_categories:
+        if used_category_count >= max_categories:
+            break
+
+        candidates = clickhouse_client.fetch_products_for_category(category=cat, eco_preference="high")
+        picked_in_cat = 0
+        for p in candidates:
+            variant_numeric = _gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or ""))
+            if not variant_numeric or str(variant_numeric) in seen_variant_keys:
+                continue
+            seen_variant_keys.add(str(variant_numeric))
+
+            price = (int(p.get("price_cents", 0)) or 0) / 100.0
+            pack_size = int(p.get("pack_size", 1) or 1)
+            item_id = int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric
+            cards.append(
+                ExternalProductCard(
+                    product_id=str(p.get("product_gid") or p.get("product_id") or ""),
+                    variant_id=variant_numeric,
+                    title=p.get("title", ""),
+                    description="Additional recommended product based on your interest.",
+                    price=price,
+                    currency="USD",
+                    image_url=p.get("image_url") or None,
+                    product_url=f"/products/{p.get('handle','')}",
+                    badges=["you-may-like", "eco-friendly"],
+                    options=[],
+                    selected_options={},
+                    quantity=1,
+                    cart_item={"id": item_id, "quantity": 1},
+                    pack_size=pack_size,
+                    packs_recommended=1,
+                    total_units=pack_size,
+                    key_benefits=[],
+                    statistics=None,
+                )
+            )
+            picked_in_cat += 1
+            if len(cards) >= limit:
+                return cards
+            if picked_in_cat >= per_category_limit:
+                break
+
+        if picked_in_cat > 0:
+            used_category_count += 1
+    return cards
+
+
 def _build_product_list_payload(
     *,
     message: str,
@@ -240,10 +588,12 @@ def _build_product_list_payload(
     for p in alt_products[:10]:
         price = (int(p.get("price_cents", 0)) or 0) / 100.0
         pack_size = int(p.get("pack_size", 1) or 1)
+        variant_numeric = _gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or ""))
+        item_id = int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric
         cards.append(
             ExternalProductCard(
                 product_id=str(p.get("product_gid") or p.get("product_id") or ""),
-                variant_id=_gid_to_numeric_id(str(p.get("variant_gid") or p.get("product_id") or "")),
+                variant_id=variant_numeric,
                 title=p.get("title", ""),
                 description=f"Alternative {subcategory_label.lower()} option from our catalog.",
                 price=price,
@@ -254,6 +604,7 @@ def _build_product_list_payload(
                 options=[],
                 selected_options={},
                 quantity=1,
+                cart_item={"id": item_id, "quantity": 1} if variant_numeric else None,
                 pack_size=pack_size,
                 packs_recommended=1,
                 total_units=pack_size,
@@ -262,10 +613,13 @@ def _build_product_list_payload(
             )
         )
 
+    additional_cards = _build_additional_recommendations(alt_products, limit=6)
+
     payload = ExternalChatPayload(
         message=message,
         type="product_list",
         suggested_products=cards,
+        additional_recommendations=additional_cards,
         cart_items=[],
         cart_permalink=_build_cart_permalink(
             [{"id": int(c.variant_id) if str(c.variant_id).isdigit() else c.variant_id, "quantity": 1} for c in cards[:6] if c.variant_id]
@@ -424,7 +778,7 @@ def _basket_to_product_cards(basket: BasketRecommendation) -> List[ExternalProdu
                 product_id=product_gid,
                 variant_id=variant_gid,
                 title=item.title,
-                description="EcoSoul party supply recommendation.",
+                description="Curated party pick — compostable & guest-ready.",
                 price=price,
                 currency="USD",
                 image_url=meta.get("image_url") or None,
@@ -433,6 +787,14 @@ def _basket_to_product_cards(basket: BasketRecommendation) -> List[ExternalProdu
                 options=[],
                 selected_options={},
                 quantity=packs,
+                cart_item={
+                    "id": int(_gid_to_numeric_id(variant_gid))
+                    if _gid_to_numeric_id(variant_gid).isdigit()
+                    else _gid_to_numeric_id(variant_gid),
+                    "quantity": max(1, int(packs)),
+                }
+                if _gid_to_numeric_id(variant_gid)
+                else None,
                 pack_size=pack_size,
                 packs_recommended=packs,
                 total_units=total_units,
@@ -475,24 +837,210 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             ctx.estimated_coverage = session.last_basket.estimated_coverage
             return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
 
+    # Party basket editing commands should take precedence over routing.
+    # This ensures phrases like "remove cups" don't accidentally get treated as
+    # browsing/category selection.
+    if (
+        session.mode == ConversationMode.PARTY_PLANNING
+        and session.last_basket is not None
+        and any(w in lower for w in ["remove", "delete", "add", "include", "packs", "pack", "quantity", "qty"])
+    ):
+        edited = _basket_edit_apply(lower, session.last_basket)
+        session.last_basket = edited
+        cards = _basket_to_product_cards(edited)
+
+        cart_items: List[dict] = []
+        for c in cards:
+            vid = _gid_to_numeric_id(c.variant_id)
+            qty = int(c.quantity or c.packs_recommended or 1)
+            if vid:
+                cart_items.append({"id": int(vid) if vid.isdigit() else vid, "quantity": max(1, qty)})
+        cart_permalink = _build_cart_permalink(cart_items)
+        # Persist cart payload so it stays correct when user switches to browsing/search.
+        session.cart_items = cart_items
+
+        payload = ExternalChatPayload(
+            message="Updated your party basket. Would you like to add everything to cart or change anything else?",
+            type="party_recommendation",
+            suggested_products=cards,
+            cart_items=cart_items,
+            cart_permalink=cart_permalink,
+            quick_replies=["Add all to cart", "Adjust quantities", "Remove an item", "Add more items", "Browse products"],
+        )
+        ctx = ExternalConversationContext(
+            detected_intent=Intent.EDIT_QUANTITY.value,
+            detected_disposables=session.party_plan.disposables_needed or [],
+            party_size=session.party_plan.party_size,
+            estimated_coverage=edited.estimated_coverage,
+            products_discussed=[c.product_id for c in cards],
+            pending_actions=["awaiting_cart_confirmation"],
+            mode=session.mode,
+            current_category=session.current_category,
+            current_subcategory=session.current_subcategory,
+        )
+        return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
+
     # Mode selection by keywords (must happen before any welcome return)
-    if any(kw in lower for kw in ["plan a party", "party", "birthday"]):
+    # If user is editing the existing party basket, do not switch to browsing mode
+    # just because they used a product keyword (e.g. "remove cups").
+    if (
+        session.mode == ConversationMode.PARTY_PLANNING
+        and session.last_basket is not None
+        and any(
+            kw in lower
+            for kw in [
+                "remove",
+                "delete",
+                "add",
+                "include",
+                "adjust",
+                "packs",
+                "pack",
+                "quantity",
+                "qty",
+            ]
+        )
+    ):
         session.mode = ConversationMode.PARTY_PLANNING
-    elif any(kw in lower for kw in ["browse products", "browse", "products", "tableware", "drinkware", "kitchenware", "personal care"]):
+    elif any(
+        kw in lower
+        for kw in [
+            "event plan",
+            "event campaign",
+            "marketing campaign",
+            "sales campaign",
+            "merchandising",
+            "promo campaign",
+            "promotion campaign",
+        ]
+    ):
+        session.mode = ConversationMode.EVENT_CAMPAIGN
+        session.campaign_id = None
+    elif any(kw in lower for kw in ["plan a party", "party", "birthday"]):
+        session.mode = ConversationMode.PARTY_PLANNING
+    elif any(
+        kw in lower
+        for kw in [
+            "event plan",
+            "event campaign",
+            "marketing campaign",
+            "sales campaign",
+            "merchandising",
+            "campaign merchandise",
+        ]
+    ):
+        session.mode = ConversationMode.EVENT_CAMPAIGN
+        session.campaign_id = None
+    elif any(
+        kw in lower
+        for kw in [
+            "browse products",
+            "browse",
+            "search",
+            "find",
+            "products",
+            "tableware",
+            "drinkware",
+            "kitchenware",
+            "personal care",
+            # Leaf-ish keywords so users can type “napkins”, “plates”, “cups”, etc.
+            "plate",
+            "plates",
+            "bowl",
+            "bowls",
+            "cup",
+            "cups",
+            "spoon",
+            "spoons",
+            "fork",
+            "forks",
+            "straw",
+            "straws",
+            "towel",
+            "towels",
+            "napkin",
+            "napkins",
+        ]
+    ):
         session.mode = ConversationMode.PRODUCT_BROWSING
 
     # Initial welcome if we don't know what the user wants yet
     if not session.mode and not session.party_plan.party_size and not session.current_category:
+        # If the very first message is already a product search phrase,
+        # return matching products directly instead of forcing category clicks.
+        direct_search = clickhouse_client.search_products(query=text, category=None, limit=10)
+        if direct_search:
+            cards: List[ExternalProductCard] = []
+            for p in direct_search:
+                price = (int(p.get("price_cents", 0)) or 0) / 100.0
+                pack_size = int(p.get("pack_size", 1) or 1)
+                variant_numeric = _gid_to_numeric_id(str(p.get("variant_gid") or ""))
+                cards.append(
+                    ExternalProductCard(
+                        product_id=str(p.get("product_gid") or p.get("product_id") or ""),
+                        variant_id=variant_numeric
+                        or str(p.get("variant_gid") or p.get("product_id") or ""),
+                        title=p.get("title", ""),
+                        description="EcoSoul product",
+                        price=price,
+                        currency="USD",
+                        image_url=p.get("image_url") or None,
+                        product_url=f"/products/{p.get('handle','')}",
+                        badges=["eco-friendly"],
+                        options=[],
+                        selected_options={},
+                        quantity=1,
+                        cart_item={
+                            "id": int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric,
+                            "quantity": 1,
+                        }
+                        if variant_numeric
+                        else None,
+                        pack_size=pack_size,
+                        packs_recommended=1,
+                        total_units=pack_size,
+                        key_benefits=[],
+                        statistics=None,
+                    )
+                )
+
+            payload = ExternalChatPayload(
+                message=f"**{ASSISTANT_NAME}** found strong matches for “{text}” — take your pick below.",
+                type="product_list",
+                suggested_products=cards,
+                additional_recommendations=_build_additional_recommendations(direct_search, limit=6),
+                cart_items=session.cart_items or [],
+                cart_permalink=_build_cart_permalink(session.cart_items or []),
+                quick_replies=["Browse products", "Event plan", "Plan a party", "Different category"],
+            )
+            ctx = ExternalConversationContext(
+                detected_intent=Intent.UNKNOWN.value,
+                detected_disposables=session.party_plan.disposables_needed or [],
+                party_size=session.party_plan.party_size,
+                estimated_coverage={},
+                products_discussed=[c.product_id for c in cards],
+                pending_actions=[],
+                mode=ConversationMode.PRODUCT_BROWSING,
+                current_category=None,
+                current_subcategory=None,
+            )
+            session.mode = ConversationMode.PRODUCT_BROWSING
+            return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
+
         payload = ExternalChatPayload(
-            message="Hi! I'm your EcoSoul assistant. Would you like to plan a party or browse products?",
+            message=(
+                f"Welcome — I’m **{ASSISTANT_NAME}**, **{ASSISTANT_TAGLINE}** for EcoSoul. "
+                "I can shape a party bundle, open the catalog, or curate picks for a **marketing / sales campaign**. "
+                "What would you like to do?"
+            ),
             type="welcome",
             suggested_products=[],
             cart_items=session.cart_items or [],
             cart_permalink=_build_cart_permalink(session.cart_items or []),
-            quick_replies=["Plan a party", "Browse products"],
+            quick_replies=["Plan a party", "Browse products", "Event plan"],
             suggested_questions=[
-                "Help me plan a birthday party",
-                "Show me tableware products",
+                "Curate products for our summer campaign",
+                "Plan eco-friendly disposables for 40 guests",
             ],
         )
         ctx = ExternalConversationContext(
@@ -507,6 +1055,10 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             current_subcategory=session.current_subcategory,
         )
         return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
+
+    # EVENT / CAMPAIGN (marketing & sales curated assortments)
+    if session.mode == ConversationMode.EVENT_CAMPAIGN:
+        return _handle_event_campaign_flow(session, request.session_id, text, lower)
 
     # PARTY PLANNING
     if session.mode == ConversationMode.PARTY_PLANNING or not session.mode:
@@ -535,13 +1087,18 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
                 if vid:
                     cart_items.append({"id": int(vid) if vid.isdigit() else vid, "quantity": max(1, qty)})
             cart_permalink = _build_cart_permalink(cart_items)
+            # Persist cart payload so it stays correct when user switches to browsing/search.
+            session.cart_items = cart_items
             payload = ExternalChatPayload(
-                message="Great, your party set is ready. The frontend can now use these cart_items or the cart_permalink to add everything to the Shopify cart.",
+                message=(
+                    "Your party set is ready — use **cart_items** or **cart_permalink** to load everything into Shopify, "
+                    "or add line-by-line with the per-product payloads."
+                ),
                 type="party_recommendation",
                 suggested_products=cards,
                 cart_items=cart_items,
                 cart_permalink=cart_permalink,
-                quick_replies=["Plan another party", "Browse products"],
+                quick_replies=["Plan another party", "Browse products", "Event plan"],
             )
             ctx = ExternalConversationContext(
                 detected_intent=Intent.CONFIRM_ADD_TO_CART.value,
@@ -568,13 +1125,15 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
                 if vid:
                     cart_items.append({"id": int(vid) if vid.isdigit() else vid, "quantity": max(1, qty)})
             cart_permalink = _build_cart_permalink(cart_items)
+            # Persist cart payload so it stays correct when user switches to browsing/search.
+            session.cart_items = cart_items
             payload = ExternalChatPayload(
                 message="Updated your party basket. Would you like to add everything to cart or change anything else?",
                 type="party_recommendation",
                 suggested_products=cards,
                 cart_items=cart_items,
                 cart_permalink=cart_permalink,
-                quick_replies=["Add all to cart", "Adjust quantities", "Remove an item", "Add more items"],
+                quick_replies=["Add all to cart", "Adjust quantities", "Remove an item", "Add more items", "Browse products"],
             )
             ctx = ExternalConversationContext(
                 detected_intent=Intent.EDIT_QUANTITY.value,
@@ -629,15 +1188,18 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
         if not session.party_plan.party_size:
             if intent == Intent.SMALL_TALK or intent == Intent.UNKNOWN or missing_slots:
                 payload = ExternalChatPayload(
-                    message="Hi! I'm your EcoSoul party planning assistant. How many guests are you expecting?",
+                    message=(
+                        f"Lovely — **{ASSISTANT_NAME}** can build a thoughtful disposable set. "
+                        "Roughly how many guests should we plan for?"
+                    ),
                     type="question",
                     suggested_products=[],
                     cart_items=session.cart_items or [],
                     cart_permalink=_build_cart_permalink(session.cart_items or []),
                     quick_replies=["10 guests", "25 guests", "50 guests", "More than 100"],
                     suggested_questions=[
-                        "What products do you recommend?",
-                        "Tell me about eco-friendly options",
+                        "What should I order for cocktails and appetizers?",
+                        "Tell me about compostable options",
                     ],
                 )
                 ctx = ExternalConversationContext(
@@ -686,15 +1248,20 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             if vid:
                 cart_items.append({"id": int(vid) if vid.isdigit() else vid, "quantity": max(1, qty)})
         cart_permalink = _build_cart_permalink(cart_items)
+        # Persist cart payload so it stays correct when user switches to browsing/search.
+        session.cart_items = cart_items
 
-        msg = f"For {session.party_plan.party_size} guests, here’s an eco-friendly recommendation with a small backup so you don’t run out."
+        msg = (
+            f"For **{session.party_plan.party_size} guests**, here’s a balanced eco-friendly lineup with a little extra "
+            "so you’re not caught short."
+        )
         payload = ExternalChatPayload(
             message=msg,
             type="party_recommendation",
             suggested_products=cards,
             cart_items=cart_items,
             cart_permalink=cart_permalink,
-            quick_replies=["Add all to cart", "Adjust quantities", "Show more options"],
+            quick_replies=["Add all to cart", "Adjust quantities", "Show more options", "Browse products", "Event plan"],
             suggested_questions=[
                 f"What if I have {(session.party_plan.party_size or 0) + 10} guests?",
                 "Do you have matching bowls?",
@@ -715,9 +1282,13 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
         return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
 
     # PRODUCT BROWSING / SIMPLE SEARCH
-    session.mode = session.mode or ConversationMode.PRODUCT_BROWSING
+    if session.mode != ConversationMode.EVENT_CAMPAIGN:
+        session.mode = session.mode or ConversationMode.PRODUCT_BROWSING
 
     if lower in ("different category", "change category", "back", "categories", "show categories"):
+        # After a party, explicitly switch to browsing mode so that subsequent
+        # user messages can use the browse/search flow.
+        session.mode = ConversationMode.PRODUCT_BROWSING
         session.current_category = None
         session.current_subcategory = None
         payload = ExternalChatPayload(
@@ -750,8 +1321,70 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
     if lower in ("personal care", "personal_care"):
         session.current_category = "personal care"
 
-    # If still no category, show category menu
+    # If still no category, either:
+    # 1) Try a free-text product search (so “napkins” works directly)
+    # 2) Otherwise show the category menu.
     if not session.current_category:
+        search_products = clickhouse_client.search_products(query=text, category=None, limit=10)
+        if search_products:
+            cards: List[ExternalProductCard] = []
+            for p in search_products:
+                price = (int(p.get("price_cents", 0)) or 0) / 100.0
+                pack_size = int(p.get("pack_size", 1) or 1)
+                variant_numeric = _gid_to_numeric_id(str(p.get("variant_gid") or ""))
+                cards.append(
+                    ExternalProductCard(
+                        product_id=str(p.get("product_gid") or p.get("product_id") or ""),
+                        variant_id=variant_numeric
+                        or str(p.get("variant_gid") or p.get("product_id") or ""),
+                        title=p.get("title", ""),
+                        description="EcoSoul product",
+                        price=price,
+                        currency="USD",
+                        image_url=p.get("image_url") or None,
+                        product_url=f"/products/{p.get('handle','')}",
+                        badges=["eco-friendly"],
+                        options=[],
+                        selected_options={},
+                        quantity=1,
+                        cart_item={
+                            "id": int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric,
+                            "quantity": 1,
+                        }
+                        if variant_numeric
+                        else None,
+                        pack_size=pack_size,
+                        packs_recommended=1,
+                        total_units=pack_size,
+                        key_benefits=[],
+                        statistics=None,
+                    )
+                )
+
+            cart_items = session.cart_items or []
+            payload = ExternalChatPayload(
+                message=f"Here are matching products for '{text}':",
+                type="product_list",
+                suggested_products=cards,
+                additional_recommendations=_build_additional_recommendations(search_products, limit=6),
+                cart_items=cart_items,
+                cart_permalink=_build_cart_permalink(cart_items),
+                quick_replies=["Different category", "Plan a party", "Browse products"],
+            )
+            ctx = ExternalConversationContext(
+                detected_intent=Intent.UNKNOWN.value,
+                detected_disposables=session.party_plan.disposables_needed or [],
+                party_size=session.party_plan.party_size,
+                estimated_coverage={},
+                products_discussed=[c.product_id for c in cards],
+                pending_actions=[],
+                mode=session.mode,
+                current_category=None,
+                current_subcategory=None,
+            )
+            return ExternalChatResponse(success=True, session_id=request.session_id, response=payload, conversation_context=ctx)
+
+        # No category and no search results -> show menu.
         payload = ExternalChatPayload(
             message="What category would you like to explore?",
             type="category_menu",
@@ -830,6 +1463,12 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
                 options=[],
                 selected_options={},
                 quantity=1,
+                cart_item={
+                    "id": int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric,
+                    "quantity": 1,
+                }
+                if variant_numeric
+                else None,
                 pack_size=pack_size,
                 packs_recommended=1,
                 total_units=pack_size,
@@ -856,6 +1495,7 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
             message=f"Here are some {subcategory_label} you can explore:",
             type="product_list",
             suggested_products=cards,
+            additional_recommendations=_build_additional_recommendations(products, limit=6),
             cart_items=session.cart_items or [],
             cart_permalink=_build_cart_permalink(session.cart_items or []) or cart_permalink,
             quick_replies=["Show more products", "Different category", "Plan a party"],

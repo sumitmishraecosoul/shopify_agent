@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from pydantic import AnyHttpUrl
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Load .env from shopify_assistant folder (so it works when uvicorn is run from project root)
@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     """
 
     # Service
-    APP_NAME: str = "Shopify Party Planning Assistant"
+    APP_NAME: str = "Verdant · EcoSoul Intelligence"
     APP_VERSION: str = "0.1.0"
     PORT: int = 8010  # API server port (avoid 8000 if another app uses it)
 
@@ -36,9 +36,23 @@ class Settings(BaseSettings):
     # Cart token from browser cookie "cart" (or from GET /cart.js). Optional: set in .env for server-side testing; in production frontend sends cart_token in request body.
     SHOPIFY_CART_TOKEN: Optional[str] = None
 
-    class Config:
-        env_file = str(_env_path) if _env_path.exists() else ".env"
-        env_file_encoding = "utf-8"
+    # API auth (for /api/v1/* routes)
+    API_AUTH_USERNAME: str = "shopify_client_app"
+    API_AUTH_PASSWORD: str = "change-me"
+    API_AUTH_TOKEN_TTL_SECONDS: int = 3600
+
+    # Stable token for automation scripts (inventory refresh trigger).
+    # If set, scripts can call refresh with:
+    # Authorization: Bearer <INVENTORY_REFRESH_SERVICE_TOKEN>
+    INVENTORY_REFRESH_SERVICE_TOKEN: Optional[str] = None
+
+    # Ignore unknown keys in .env (e.g. AZURE_*), so adding deployment vars
+    # doesn't break app startup.
+    model_config = SettingsConfigDict(
+        env_file=str(_env_path) if _env_path.exists() else ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()
