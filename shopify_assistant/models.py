@@ -235,3 +235,14 @@ class AuthLoginResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
 
+
+class AuthSignupRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthSignupResponse(BaseModel):
+    success: bool
+    username: str
+    message: str
+

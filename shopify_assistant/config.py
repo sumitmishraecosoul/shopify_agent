@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     API_AUTH_PASSWORD: str = "change-me"
     API_AUTH_TOKEN_TTL_SECONDS: int = 3600
 
+    # MongoDB (optional; used for signup/login user store)
+    # Example: mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
+    MONGO_URL: Optional[str] = None
+    DB_NAME: str = "shopify_assistant"
+
     # Stable token for automation scripts (inventory refresh trigger).
     # If set, scripts can call refresh with:
     # Authorization: Bearer <INVENTORY_REFRESH_SERVICE_TOKEN>

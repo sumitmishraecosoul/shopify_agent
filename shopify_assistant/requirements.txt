@@ -6,3 +6,7 @@ requests
 azure-storage-blob
 clickhouse-connect
 streamlit
+pymongo
+passlib[bcrypt]==1.7.4
+# passlib 1.7.4 is not compatible with bcrypt>=4 (module attribute changes)
+bcrypt==3.2.2
