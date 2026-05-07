@@ -305,7 +305,8 @@ def _dict_products_to_cards(products: List[dict], description: str = "EcoSoul pr
         cards.append(
             ExternalProductCard(
                 product_id=str(p.get("product_gid") or p.get("product_id") or ""),
-                variant_id=variant_numeric or str(p.get("variant_gid") or p.get("product_id") or ""),
+                # Always return the numeric variant id when available (Shopify cart endpoints require it).
+                variant_id=variant_numeric,
                 title=p.get("title", ""),
                 description=description,
                 price=price,
@@ -741,6 +742,7 @@ def _basket_to_product_cards(basket: BasketRecommendation) -> List[ExternalProdu
         meta = clickhouse_client.get_product_by_internal_id(item.product_id) or {}
 
         variant_gid = str(meta.get("variant_gid") or item.product_id)
+        variant_numeric = _gid_to_numeric_id(variant_gid)
         product_gid = str(meta.get("product_gid") or variant_gid)
         handle = str(meta.get("handle") or "")
         product_url = f"/products/{handle}" if handle else ""
@@ -776,7 +778,8 @@ def _basket_to_product_cards(basket: BasketRecommendation) -> List[ExternalProdu
         cards.append(
             ExternalProductCard(
                 product_id=product_gid,
-                variant_id=variant_gid,
+                # Always return the numeric variant id when available (Shopify cart endpoints require it).
+                variant_id=variant_numeric,
                 title=item.title,
                 description="Curated party pick — compostable & guest-ready.",
                 price=price,
@@ -788,12 +791,10 @@ def _basket_to_product_cards(basket: BasketRecommendation) -> List[ExternalProdu
                 selected_options={},
                 quantity=packs,
                 cart_item={
-                    "id": int(_gid_to_numeric_id(variant_gid))
-                    if _gid_to_numeric_id(variant_gid).isdigit()
-                    else _gid_to_numeric_id(variant_gid),
+                    "id": int(variant_numeric) if str(variant_numeric).isdigit() else variant_numeric,
                     "quantity": max(1, int(packs)),
                 }
-                if _gid_to_numeric_id(variant_gid)
+                if variant_numeric
                 else None,
                 pack_size=pack_size,
                 packs_recommended=packs,
@@ -978,8 +979,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
                 cards.append(
                     ExternalProductCard(
                         product_id=str(p.get("product_gid") or p.get("product_id") or ""),
-                        variant_id=variant_numeric
-                        or str(p.get("variant_gid") or p.get("product_id") or ""),
+                        # Always return the numeric variant id when available (Shopify cart endpoints require it).
+                        variant_id=variant_numeric,
                         title=p.get("title", ""),
                         description="EcoSoul product",
                         price=price,
@@ -1335,8 +1336,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
                 cards.append(
                     ExternalProductCard(
                         product_id=str(p.get("product_gid") or p.get("product_id") or ""),
-                        variant_id=variant_numeric
-                        or str(p.get("variant_gid") or p.get("product_id") or ""),
+                        # Always return the numeric variant id when available (Shopify cart endpoints require it).
+                        variant_id=variant_numeric,
                         title=p.get("title", ""),
                         description="EcoSoul product",
                         price=price,
@@ -1452,7 +1453,8 @@ def external_chat(request: ChatRequest) -> ExternalChatResponse:
         cards.append(
             ExternalProductCard(
                 product_id=str(p.get("product_gid") or p.get("product_id") or ""),
-                variant_id=variant_numeric or str(p.get("variant_gid") or p.get("product_id") or ""),
+                # Always return the numeric variant id when available (Shopify cart endpoints require it).
+                variant_id=variant_numeric,
                 title=p.get("title", ""),
                 description="EcoSoul product",
                 price=price,
