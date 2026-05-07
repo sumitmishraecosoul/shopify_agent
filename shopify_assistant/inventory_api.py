@@ -27,6 +27,10 @@ class InventoryRefreshRequest(BaseModel):
     date: str | None = Field(default=None, examples=["2026-04-30"])
     # If true, forces re-download/reload even if the ETag is unchanged.
     force: bool = False
+    # Optional overrides for multi-client setups.
+    # If provided, these override the server-side AZURE_CONTAINER_NAME/AZURE_BLOB_PATH_TEMPLATE resolution.
+    container_name: str | None = Field(default=None, examples=["thrive-client-ecosoulhome"])
+    blob_path: str | None = Field(default=None, examples=["data_dump/inventory/shopify/2026/05/07/us_shopify_inventory.json"])
 
 
 @router.post("/refresh", response_model=InventoryRefreshResponse)
@@ -36,6 +40,8 @@ def refresh_inventory(req: InventoryRefreshRequest, request: Request) -> Invento
         log=True,
         requested_date=req.date,
         force=req.force,
+        container_name=req.container_name,
+        blob_path=req.blob_path,
         triggered_by=f"{request.client.host if request.client else 'unknown'}",
     )
     return InventoryRefreshResponse(

@@ -53,6 +53,8 @@ class ClickHouseClient:
         log: bool = False,
         requested_date: str | None = None,
         force: bool = False,
+        container_name: str | None = None,
+        blob_path: str | None = None,
         triggered_by: str | None = None,
     ) -> tuple[bool, str, dict]:
         """
@@ -83,6 +85,8 @@ class ClickHouseClient:
                 downloaded, download_msg, dl_meta = self._download_inventory_to_primary(
                     requested_date=requested_date,
                     force=force,
+                    container_name=container_name,
+                    blob_path=blob_path,
                 )
                 meta.update(dl_meta or {})
                 meta["downloaded"] = bool(downloaded)
@@ -90,6 +94,12 @@ class ClickHouseClient:
                     who = f" triggered_by={triggered_by}" if triggered_by else ""
                     sys.stderr.write(f"{download_msg}{who}\n")
                     sys.stderr.flush()
+
+                # If force was requested, we expect a re-download attempt. If it didn't download,
+                # return a failure so callers can detect that the remote refresh did not happen.
+                if force and not downloaded:
+                    meta["duration_ms"] = int((time.time() - started) * 1000)
+                    return False, f"force requested but download did not occur: {download_msg}", meta
 
                 # Idempotency: if Azure file is unchanged and force is false, skip reloading/parsing.
                 if (
@@ -133,7 +143,14 @@ class ClickHouseClient:
             return self._json_path_primary
         return self._json_path_v3 if self._json_path_v3.exists() else self._json_path_v1
 
-    def _download_inventory_to_primary(self, *, requested_date: str | None, force: bool) -> tuple[bool, str, dict]:
+    def _download_inventory_to_primary(
+        self,
+        *,
+        requested_date: str | None,
+        force: bool,
+        container_name: str | None,
+        blob_path: str | None,
+    ) -> tuple[bool, str, dict]:
         """
         Download inventory JSON to `us_shopify_inventory.json` using either:
         - INVENTORY_JSON_URL (direct/SAS URL)
@@ -152,6 +169,8 @@ class ClickHouseClient:
                 return datetime.now()
 
         dt = _resolve_date()
+        blob_path_override = (blob_path or "").strip().lstrip("/") or None
+        container_override = (container_name or "").strip() or None
 
         # 1) Direct/SAS URL
         inventory_url = (os.getenv("INVENTORY_JSON_URL") or "").strip()
@@ -177,19 +196,23 @@ class ClickHouseClient:
         sas_token = (os.getenv("INVENTORY_JSON_BLOB_SAS_TOKEN") or "").strip().lstrip("?")
         blob_path_template = (os.getenv("INVENTORY_JSON_BLOB_PATH_TEMPLATE") or "").strip()
         if container_url and sas_token and blob_path_template:
-            blob_path = blob_path_template.format(YYYY=dt.strftime("%Y"), MM=dt.strftime("%m"), DD=dt.strftime("%d")).lstrip("/")
-            url = f"{container_url}/{blob_path}?{sas_token}"
-            meta["blob_path"] = blob_path
+            resolved_blob_path = blob_path_override or blob_path_template.format(
+                YYYY=dt.strftime("%Y"),
+                MM=dt.strftime("%m"),
+                DD=dt.strftime("%d"),
+            ).lstrip("/")
+            url = f"{container_url}/{resolved_blob_path}?{sas_token}"
+            meta["blob_path"] = resolved_blob_path
             try:
                 r = requests.get(url, timeout=60)
                 r.raise_for_status()
                 etag = (r.headers.get("ETag") or r.headers.get("Etag") or "").strip() or None
                 meta["etag"] = etag
-                if (not force) and etag and etag == self._last_inventory_etag and blob_path == self._last_inventory_blob_path:
+                if (not force) and etag and etag == self._last_inventory_etag and resolved_blob_path == self._last_inventory_blob_path:
                     return False, "Inventory unchanged (etag match) - skipping download", meta
                 self._json_path_primary.write_bytes(r.content)
                 self._last_inventory_etag = etag
-                self._last_inventory_blob_path = blob_path
+                self._last_inventory_blob_path = resolved_blob_path
                 self._last_inventory_bytes = len(r.content)
                 meta["bytes"] = self._last_inventory_bytes
                 return True, "Loaded inventory from Azure (SAS) -> saved to us_shopify_inventory.json", meta
@@ -198,16 +221,20 @@ class ClickHouseClient:
 
         # 3) Connection string + container + template
         azure_conn = (os.getenv("AZURE_CONNECTION_STRING") or "").strip()
-        azure_container = (os.getenv("AZURE_CONTAINER_NAME") or "").strip()
+        azure_container = container_override or (os.getenv("AZURE_CONTAINER_NAME") or "").strip()
         azure_blob_template = (os.getenv("AZURE_BLOB_PATH_TEMPLATE") or "").strip()
         if azure_conn and azure_container and azure_blob_template and BlobClient is not None:
-            blob_path = azure_blob_template.format(YYYY=dt.strftime("%Y"), MM=dt.strftime("%m"), DD=dt.strftime("%d")).lstrip("/")
-            meta["blob_path"] = blob_path
+            resolved_blob_path = blob_path_override or azure_blob_template.format(
+                YYYY=dt.strftime("%Y"),
+                MM=dt.strftime("%m"),
+                DD=dt.strftime("%d"),
+            ).lstrip("/")
+            meta["blob_path"] = resolved_blob_path
             try:
                 bc = BlobClient.from_connection_string(
                     conn_str=azure_conn,
                     container_name=azure_container,
-                    blob_name=blob_path,
+                    blob_name=resolved_blob_path,
                 )
                 try:
                     props = bc.get_blob_properties()
@@ -216,14 +243,14 @@ class ClickHouseClient:
                 except Exception:
                     etag = None
                 meta["etag"] = etag
-                if (not force) and etag and etag == self._last_inventory_etag and blob_path == self._last_inventory_blob_path:
+                if (not force) and etag and etag == self._last_inventory_etag and resolved_blob_path == self._last_inventory_blob_path:
                     return False, "Inventory unchanged (etag match) - skipping download", meta
                 data = bc.download_blob().readall()
                 if not data:
                     return False, "Azure download returned empty payload", meta
                 self._json_path_primary.write_bytes(data)
                 self._last_inventory_etag = etag
-                self._last_inventory_blob_path = blob_path
+                self._last_inventory_blob_path = resolved_blob_path
                 self._last_inventory_bytes = len(data)
                 meta["bytes"] = self._last_inventory_bytes
                 return True, "Loaded inventory from Azure (conn str) -> saved to us_shopify_inventory.json", meta
